@@ -8,7 +8,13 @@
 namespace griha {
 
 class Reader {
+
+    struct Impl;
+
 public:
+    struct State;
+    using StatePtr = std::shared_ptr<State>;
+
     struct Metrics {
         size_t nlines;
         size_t nstatements;
@@ -28,13 +34,12 @@ public:
 
     void subscribe(ReaderSubscriberPtr subscriber);
 
-    void consume(std::string_view line);
+    StatePtr consume(std::string_view line, StatePtr state = StatePtr{});
+
     const Metrics& get_metrics() const;
 
-    void on_eof();
-
 private:
-    std::unique_ptr<struct ReaderImpl> priv_;
+    std::unique_ptr<Impl> priv_;
 };
 
 } // namespace griha

@@ -33,19 +33,21 @@ struct Connection : std::enable_shared_from_this<Connection> {
             asio::dynamic_buffer(data), '\n',
             [this, self = shared_from_this()] (const error_code& ec, std::size_t size) {
                 if (size != 0) {
-                    interpreter->consume(std::string_view { data.data(), size - 1 });
+                    intrp_state = interpreter->consume(
+                        std::string_view { data.data(), size - 1 }, intrp_state);
                     data.erase(0, size);
                 }
                 
                 if (!ec)
                     do_read();
                 else if (!data.empty())
-                        interpreter->consume(data);
+                    interpreter->consume(data, intrp_state);
             });
     }
 
     tcp::socket socket;
     InterpreterPtr interpreter;
+    Interpreter::StatePtr intrp_state;
     std::string data;
 };
 using ConnectionPtr = std::shared_ptr<Connection>;

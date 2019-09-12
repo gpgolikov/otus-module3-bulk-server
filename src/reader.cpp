@@ -28,139 +28,133 @@ bool is_block_end(std::string_view line) {
 
 } // unnamed namespace
 
-struct ReaderState : std::enable_shared_from_this<ReaderState> {
-    virtual ~ReaderState() {}
-    virtual void process(std::string_view) = 0;
-    virtual void on_eof() {}
+struct Reader::State : std::enable_shared_from_this<State> {
+    using ReaderImpl = Reader::Impl;
+
+    virtual ~State() {}
+    virtual StatePtr process(std::string_view) = 0;
 };
-using ReaderStatePtr = std::shared_ptr<ReaderState>;
 
-struct ReaderImpl {
+struct InitialState;
 
-    inline ReaderImpl(size_t bsize)
-        : state(nullptr)
-        , block_size(bsize) {}
+struct Reader::Impl {
 
-    ReaderStatePtr state;
+    explicit inline Impl(size_t bsize) : block_size(bsize) {}
+
+    std::weak_ptr<InitialState> initial_state;
+
     const size_t block_size;
-
     std::vector<ReaderSubscriberPtr> subscribers;
-
     StatementFactory statement_factory;
-    StatementContainer statements;
-
     Reader::Metrics metrics;
 
-    template <typename State> State& change_state(); 
+    template <typename S> std::shared_ptr<S> get_state();
 
-    void parse(std::string_view line);
+    StatementPtr parse(std::string_view line);
 
-    void process(std::string_view line);
-    void on_eof();
+    StatePtr process(std::string_view line, StatePtr state);
 
-    void notify_block();
-    void notify_unexpected_eof();
+    void notify_block(StatementContainer& stms);
 };
 
-struct InitialState : ReaderState {
+struct InitialState : Reader::State {
     inline explicit InitialState(ReaderImpl& r_impl)
         : reader_impl(r_impl) {}
 
-    void process(std::string_view line) override;
-    void on_eof() override;
+    inline ~InitialState();
+
+    Reader::StatePtr process(std::string_view line) override;
 
     ReaderImpl& reader_impl;
-    size_t count {};
+    StatementContainer statements;
 };
 
-struct BlockState : ReaderState {
+struct BlockState : Reader::State {
     inline BlockState(ReaderImpl& r_impl) 
         : reader_impl(r_impl) {}
 
-    void process(std::string_view line) override;
-    void on_eof() override;
+    Reader::StatePtr process(std::string_view line) override;
 
     ReaderImpl& reader_impl;
+    StatementContainer statements;
     size_t level { 1 };
 };
 
-struct ErrorState : ReaderState {
+struct ErrorState : Reader::State {
     inline ErrorState(ReaderImpl& r_impl)
         : reader_impl(r_impl) {}
 
-    void process(std::string_view line) override;
+    Reader::StatePtr process(std::string_view line) override;
 
     ReaderImpl& reader_impl;
     std::string error;
 };
 
-template <typename State>
-State& ReaderImpl::change_state() {
-    // for further optimization it looks pretty to create states pool
-    state = std::make_shared<State>(*this);
-    return dynamic_cast<State&>(*state);
+template <>
+std::shared_ptr<InitialState> Reader::Impl::get_state<InitialState>() {
+    if (initial_state.expired()) {
+        auto ret = std::make_shared<InitialState>(*this);
+        initial_state = ret;
+        return ret;
+    }
+
+    return initial_state.lock();
 } 
 
-void ReaderImpl::parse(std::string_view line) {
+template <typename S>
+std::shared_ptr<S> Reader::Impl::get_state() {
+    return std::make_shared<S>(*this);
+} 
+
+StatementPtr Reader::Impl::parse(std::string_view line) {
     ++metrics.nstatements;
-    statements.push_back(statement_factory.create(std::string { line }));
+    return statement_factory.create(std::string { line });
 }
 
-void ReaderImpl::process(std::string_view line) {
+auto Reader::Impl::process(std::string_view line, StatePtr state) -> StatePtr {
     ++metrics.nlines;
-    auto save_state_ptr = state->shared_from_this(); // protect against unexpected deletion
-    return state->process(line);
+    if (state)
+        return state->process(line);
+    else
+        return get_state<InitialState>()->process(line);
 }
 
-void ReaderImpl::on_eof() {
-    state->on_eof();
-}
-
-void ReaderImpl::notify_block() {
-    if (statements.empty())
+void Reader::Impl::notify_block(StatementContainer& stms) {
+    if (stms.empty())
         return; // empty block doesn't require notification
 
     ++metrics.nblocks;
 
     for (auto& subscriber : subscribers)
-        subscriber->on_block(statements);
-    statements.clear();
+        subscriber->on_block(stms);
+    stms.clear();
 }
 
-void ReaderImpl::notify_unexpected_eof() {
-    if (statements.empty())
-        return; // empty block doesn't require notification
-
-    for (auto& subscriber : subscribers)
-        subscriber->on_unexpected_eof(statements);
+InitialState::~InitialState() {
+    reader_impl.notify_block(statements);
 }
 
-void InitialState::process(std::string_view line) {
-    using namespace std;
+Reader::StatePtr InitialState::process(std::string_view line) {
+    using namespace std::string_literals;
 
     if (is_block_end(line)) {
-        reader_impl.change_state<ErrorState>().error = "unexpected end of block"s;
+        auto ret = reader_impl.get_state<ErrorState>();
+        ret->error = "unexpected end of block"s;
+        return ret;
     } else if (is_block_begin(line)) {
-        // in initial state start of explicit block triggers end of block
-        reader_impl.notify_block();
-        reader_impl.change_state<BlockState>();
+        return reader_impl.get_state<BlockState>();
     } else {
-        reader_impl.parse(line);
-        if (++count == reader_impl.block_size) {
+        statements.push_back(reader_impl.parse(line));
+        if (statements.size() == reader_impl.block_size) {
             // fixed block size has been reached
-            reader_impl.notify_block();
-            count = 0;
+            reader_impl.notify_block(statements);
         }
     }
+
+    return shared_from_this();
 }
 
-void InitialState::on_eof() {
-    reader_impl.notify_block();
-}
-
-void BlockState::process(std::string_view line) {
-    using namespace std;
-
+Reader::StatePtr BlockState::process(std::string_view line) {
     if (is_block_begin(line)) {
         // nested explicit blocks are ignored but correction of syntax is required
         ++level;
@@ -168,26 +162,23 @@ void BlockState::process(std::string_view line) {
         if (--level == 0) {
             // explicit block has been ended
             // block has statements - notify about end of block
-            reader_impl.notify_block();
-            reader_impl.change_state<InitialState>();
+            reader_impl.notify_block(statements);
+            return reader_impl.get_state<InitialState>();
         }
     } else {
-        reader_impl.parse(line);
+        statements.push_back(reader_impl.parse(line));
     }
+
+    return shared_from_this();
 }
 
-void BlockState::on_eof() {
-    reader_impl.notify_unexpected_eof();
-}
-
-void ErrorState::process([[maybe_unused]] std::string_view line) {
+Reader::StatePtr ErrorState::process([[maybe_unused]] std::string_view line) {
     // do nothing
+    return shared_from_this();
 }
 
 Reader::Reader(size_t block_size) 
-    : priv_(std::make_unique<ReaderImpl>(block_size)) {
-    priv_->change_state<InitialState>();
-}
+    : priv_(std::make_unique<Impl>(block_size)) {}
 
 Reader::~Reader() = default;
 Reader::Reader(Reader&&) = default;
@@ -200,16 +191,12 @@ void Reader::subscribe(ReaderSubscriberPtr subscriber) {
         subscribers.push_back(std::move(subscriber));
 }
 
-void Reader::consume(std::string_view line) {
-    priv_->process(line);
+auto Reader::consume(std::string_view line, StatePtr state) -> StatePtr {
+    return priv_->process(line, state);
 }
 
 auto Reader::get_metrics() const -> const Metrics& {
     return priv_->metrics;
-}
-
-void Reader::on_eof() {
-    priv_->on_eof();
 }
 
 } // namespace griha

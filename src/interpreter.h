@@ -15,6 +15,9 @@ class Interpreter {
     struct Impl;
 
 public:
+    struct State;
+    using StatePtr = std::shared_ptr<State>;
+
     struct Context {
         Logger logger;
         size_t block_size;
@@ -31,7 +34,7 @@ public:
     Interpreter(const Interpreter&) = delete;
     Interpreter& operator= (const Interpreter&) = delete;
 
-    void consume(std::string_view data);
+    StatePtr consume(std::string_view data, StatePtr state = StatePtr{});
     void stop_and_log_metrics() const;
 
 private:

@@ -109,6 +109,12 @@ using WorkerPtr = std::shared_ptr<Worker>;
 
 } // unnamed namespace
 
+struct Interpreter::State {
+    Reader::StatePtr reader_state;
+
+    explicit State(Reader::StatePtr rs) : reader_state(rs) {}
+};
+
 struct Interpreter::Impl {
 
     const std::string name;
@@ -129,20 +135,20 @@ struct Interpreter::Impl {
         reader.subscribe(file_worker);
     }
 
-    void consume(std::string_view data);
-    void on_eof();
+    StatePtr consume(std::string_view data, StatePtr state);
+    void stop_and_print_metrics();
 
     static void log_job(const StatementContainer& stms, std::string_view name, Logger logger);
     static void file_job(const StatementContainer& stms);
 };
 
-void Interpreter::Impl::consume(std::string_view data) {
-    reader.consume(data);
+auto Interpreter::Impl::consume(std::string_view data, StatePtr state) -> StatePtr{
+    return std::make_shared<State>(
+        reader.consume(data, state ? state->reader_state : Reader::StatePtr{})
+    );
 }
 
-void Interpreter::Impl::on_eof() {
-    reader.on_eof();
-
+void Interpreter::Impl::stop_and_print_metrics() {
     // stop workers
     log_worker->stop();
     file_worker->stop();
@@ -150,6 +156,35 @@ void Interpreter::Impl::on_eof() {
     log_worker->join();
     file_worker->join();
 
+    // print metrics
+    decltype(auto) reader_metrics = reader.get_metrics();
+
+    std::ostringstream os;
+    os << '[' << name << "] Metrics" << std::endl;
+    os << "\tReader:" << std::endl;
+    os
+        << "\t\tlines - " << reader_metrics.nlines
+        << "; statements - " << reader_metrics.nstatements
+        << "; blocks - " << reader_metrics.nblocks
+        << std::endl;
+    
+    os << "\tLog:" << std::endl;
+    os
+        << "\t\tblocks - " << log_worker->thread_metrics[0].nblocks
+        << "; statements - " << log_worker->thread_metrics[0].nstatements
+        << std::endl;
+
+    os << "\tFiles:" << std::endl;
+    for (auto i = 0u; i < file_worker->thread_metrics.size(); ++i) {
+        auto &m = file_worker->thread_metrics[i];
+        os
+            << "\t#" << i
+            << "\tblocks - " << m.nblocks
+            << "; statements - " << m.nstatements
+            << std::endl;
+    }
+    
+    logger.log(os.str());
 }
 
 void Interpreter::Impl::log_job(const StatementContainer& stms, std::string_view name, Logger logger) {
@@ -216,15 +251,15 @@ Interpreter::Interpreter(Context context, std::string name)
         context.nthreads))
 {}
 
-void Interpreter::consume(std::string_view data) {
+auto Interpreter::consume(std::string_view data, StatePtr state) -> StatePtr {
     if (priv_->stopped)
-        return;
+        return StatePtr{};
 
     std::lock_guard l { priv_->guard };
     if (priv_->stopped)
-        return;
+        return StatePtr{};
 
-    priv_->consume(data);
+    return priv_->consume(data, state);
 }
 
 void Interpreter::stop_and_log_metrics() const {
@@ -238,37 +273,7 @@ void Interpreter::stop_and_log_metrics() const {
         priv_->stopped = true;
     }
 
-    priv_->on_eof();
-
-    // print metrics
-    decltype(auto) reader_metrics = priv_->reader.get_metrics();
-
-    std::ostringstream os;
-    os << '[' << priv_->name << "] Metrics" << std::endl;
-    os << "\tReader:" << std::endl;
-    os
-        << "\t\tlines - " << reader_metrics.nlines
-        << "; statements - " << reader_metrics.nstatements
-        << "; blocks - " << reader_metrics.nblocks
-        << std::endl;
-    
-    os << "\tLog:" << std::endl;
-    os
-        << "\t\tblocks - " << priv_->log_worker->thread_metrics[0].nblocks
-        << "; statements - " << priv_->log_worker->thread_metrics[0].nstatements
-        << std::endl;
-
-    os << "\tFiles:" << std::endl;
-    for (auto i = 0u; i < priv_->file_worker->thread_metrics.size(); ++i) {
-        auto &m = priv_->file_worker->thread_metrics[i];
-        os
-            << "\t#" << i
-            << "\tblocks - " << m.nblocks
-            << "; statements - " << m.nstatements
-            << std::endl;
-    }
-    
-    priv_->logger.log(os.str());
+    priv_->stop_and_print_metrics();
 }
 
 } // namespace griha
