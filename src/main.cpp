@@ -88,9 +88,10 @@ int main(int argc, char* argv[]) {
         context,
         SIGINT, SIGTERM, SIGQUIT
     };
-    signals_quit.async_wait([&context] (const error_code& ec, int /*signal number*/) {
-        context.stop();
-    });
+    signals_quit.async_wait(
+        [&context] ([[maybe_unused]] const error_code& ec, [[maybe_unused]] int sig_num) {
+            context.stop();
+        });
 
     BulkServer bulk_server {
         context,
