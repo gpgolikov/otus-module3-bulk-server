@@ -84,9 +84,11 @@ int main(int argc, char* argv[]) {
     
     asio::io_context context;
 
-    std::thread t_exit([&context]() {
-        while (std::cin)
-            std::cin.get();
+    asio::signal_set signals_quit {
+        context,
+        SIGINT, SIGTERM, SIGQUIT
+    };
+    signals_quit.async_wait([&context] (const error_code& ec, int /*signal number*/) {
         context.stop();
     });
 
@@ -98,7 +100,6 @@ int main(int argc, char* argv[]) {
     };
 
     context.run();
-    t_exit.join();
 
     bulk_server.interpreter->stop_and_log_metrics();
 }
